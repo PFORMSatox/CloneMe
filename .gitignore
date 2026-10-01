@@ -1,0 +1,8 @@
+# Per-run logs — never commit
+logs/
+*.log
+
+# Editor / OS noise
+.DS_Store
+*~
+*.swp
