@@ -39,6 +39,40 @@ detect_source_disk() {
 
 disk_bytes() { lsblk -b -ndo SIZE "$1" 2>/dev/null | tr -d ' '; }
 
+# The partition mounted as / on the SOURCE disk, e.g. /dev/nvme0n1p2.
+# Because a clone is a byte-for-byte copy, the same partition number exists on
+# the target — so this identifies root on ANY target layout, instead of guessing
+# "the first ext4" (wrong when /boot or /home are separate ext4 partitions).
+source_root_part() {
+  local src diskbase part
+  src="$(findmnt -no SOURCE / 2>/dev/null || true)"
+  [[ -n "$src" ]] || return 1
+  diskbase="$(detect_source_disk)"; diskbase="${diskbase#/dev/}"
+  part="${src#/dev/}"
+  [[ "$part" == "${diskbase}"* ]] || return 1
+  printf '%s\n' "${part#$diskbase}"   # nvme0n1p2 -> p2 ; sda3 -> 3
+}
+
+# Target partition that mirrors the source root, e.g. /dev/sdc + p2 -> /dev/sdc2
+root_part_of() { # $1 target disk (/dev/X)
+  local p
+  p="$(source_root_part)" || return 1
+  case "$p" in
+    p[0-9]*)
+      case "$1" in
+        # NVMe/loop/nbd/md use a bare number; sd/mmcblk/vd use "pN".
+        */nvme*n*|*/loop*|*/nbd*|*/md*) printf '%s%s\n' "$1" "${p#p}" ;;
+        *)                                printf '%sp%s\n' "$1" "${p#p}" ;;
+      esac ;;
+    *) return 1 ;;
+  esac
+}
+
+# Last partition number on a disk (for growing to fill the device).
+last_part_num() { # $1 disk
+  lsblk -nro NAME "$1" 2>/dev/null | sed -n 's/.*[p]\([0-9][0-9]*\)$/\1/p' | sort -n | tail -n 1
+}
+
 list_disks() {
   lsblk -d -o NAME,SIZE,MODEL,SERIAL,TRAN,PTTYPE -e7,254
   echo
@@ -151,6 +185,7 @@ cmd_clone() {
   sync
   t0="$(timer_start)"
   if [[ "$(pick_dd)" == "ddrescue" ]]; then
+    assert_writable "$target"
     ddrescue -f --force "$src" "$target" "$LOGDIR/ddrescue.map"
   else
     progress_dd "$src" "$target" "$(disk_bytes "$src")"
@@ -165,19 +200,46 @@ cmd_clone() {
 
   echo "--- step 3/4: fsck target root ---"
   partprobe "$target"; sleep 2
-  # find ext4 partition on target mirroring source p2
+  # the root partition mirroring the source's / — not "the first ext4"
   local tp2
-  tp2="$(lsblk -nro NAME,FSTYPE "$target" | awk '$2=="ext4"{print "/dev/"$1}' | head -1)"
-  if [[ -n "$tp2" ]]; then e2fsck -fy "$tp2" || echo "(fsck exit $?, check log)"; else echo "WARN: no ext4 partition found on target"; fi
+  tp2="$(root_part_of "$target")"
+  if [[ -n "$tp2" ]] && [[ -b "$tp2" ]]; then
+    e2fsck -fy "$tp2" || echo "(fsck exit $?, check log)"
+  else
+    echo "WARN: could not locate the root partition on $target (looked for $tp2)." >&2
+    echo "      Run 'sgdisk -p $target' and fsck the root partition by hand." >&2
+  fi
 
   if ((grow)); then
     echo "--- step 4/4: grow to fill larger disk (optional) ---"
-    # grow last partition then resize2fs (ext4 only)
     sgdisk -e "$target"
-    echo "NOTE: auto-grow grows last partition via parted; review before reboot."
-    parted ---pretend-input-tty "$target" resizepart 2 100% <<< "Yes" || echo "grow skipped (manual: parted $target resizepart + resize2fs)"
-    tp2="$(lsblk -nro NAME,FSTYPE "$target" | awk '$2=="ext4"{print "/dev/"$1}' | head -1)"
-    [[ -n "$tp2" ]] && resize2fs "$tp2" || true
+    # grow the LAST partition, whatever number it is (never a hardcoded 2)
+    local lastn
+    lastn="$(last_part_num "$target")"
+    if [[ -z "$lastn" ]]; then
+      echo "WARN: no partitions found on $target; skipping grow." >&2
+    else
+      echo "Growing partition $lastn to fill $target ..."
+      if parted ---pretend-input-tty "$target" resizepart "$lastn" 100% <<< "Yes"; then
+        # grow the filesystem that actually lives on that partition
+        tp2="$(root_part_of "$target")"
+        if [[ -n "$tp2" ]] && [[ -b "$tp2" ]]; then
+          if [[ "$(lsblk -ndo FSTYPE "$tp2" 2>/dev/null)" == "ext4" ]]; then
+            if resize2fs "$tp2"; then
+              echo "Grow OK: $tp2 now fills partition $lastn."
+            else
+              echo "ERROR: resize2fs failed on $tp2 — the partition is bigger but the filesystem is NOT." >&2
+              echo "       Fix with: sudo resize2fs $tp2" >&2
+            fi
+          else
+            echo "NOTE: $tp2 is not ext4; grew the partition only. Grow the filesystem manually." >&2
+          fi
+        fi
+      else
+        echo "ERROR: parted could not grow partition $lastn." >&2
+        echo "       Manual: parted $target resizepart $lastn 100%, then resize the filesystem." >&2
+      fi
+    fi
   fi
 
   echo "--- done. target partition table: ---"
@@ -234,6 +296,7 @@ cmd_restore() {
   fi
   ((yes)) || confirm_typing "$target"
   t0="$(timer_start)"
+  assert_writable "$target"
   case "$from" in
     *.zst) zstd -dc "$from" | dd of="$target" bs=64K oflag=direct status=progress conv=fsync ;;
     *) progress_dd "$from" "$target" "$(stat -c%s "$from" 2>/dev/null)" ;;
@@ -254,9 +317,10 @@ cmd_verify() {
   sgdisk -v "$target" || echo "GPT verify FAILED"
   echo "--- data compare (1MiB..101MiB, skips GPT headers rewritten by sgdisk -e) ---"
   cmp -i 1048576 -n 104857600 "$src" "$target" && echo "data-100M identical" || echo "data differs beyond 1MiB — investigate before trusting clone"
-  echo "--- fsck -n on target ext4 ---"
-  local tp2; tp2="$(lsblk -nro NAME,FSTYPE "$target" | awk '$2=="ext4"{print "/dev/"$1}' | head -1)"
-  [[ -n "$tp2" ]] && e2fsck -n "$tp2" || echo "no ext4 on target"
+  echo "--- fsck -n on target root ---"
+  local tp2; tp2="$(root_part_of "$target")"
+  if [[ -n "$tp2" ]] && [[ -b "$tp2" ]]; then e2fsck -n "$tp2" || echo "fsck found problems on $tp2"
+  else echo "could not locate root partition on $target"; fi
   blkid "$target"* 2>/dev/null || true
 }
 

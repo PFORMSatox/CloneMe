@@ -144,7 +144,7 @@ no-disk mode on every push. `tests/root-e2e.sh` is not run in CI — it needs ro
 
 - Equal-or-larger targets only
 - Live root copy is best-effort — `fsck` after, verify before trusting
-- `grow` handles ext4 last-partition only
+- `grow` grows the last partition and its filesystem; it does not add new partitions, and reports a failed `resize2fs` instead of hiding it
 - No UUID rewrite yet — see post-clone warning in `cmd_clone`
 
 ## Author

@@ -343,8 +343,8 @@ ui_main_menu() {
         if _use_curses; then
           t="$(ui_menu "Step 1/3 — pick TARGET (wiped) · Esc = back" "${menu_args[@]}")" || { pick_rc=$?; t=""; }
           [[ "$t" == "__exit" ]] && { ui_msg "Exited without cloning."; break; }
-          ((pick_rc != 0 || -z "$t")) && continue
-          [[ "/dev/$t" == "$src" ]] && { ui_msg "That is the SOURCE. It is locked."; continue; }
+          if ((pick_rc != 0)) || [[ -z "$t" ]]; then continue; fi
+          if [[ "/dev/$t" == "$src" ]]; then ui_msg "That is the SOURCE. It is locked."; continue; fi
           tgt="/dev/$t"
           opts="$(ui_checklist "Step 2/3 — options · Esc = back" verify "Re-verify after copy" on grow "Expand to fill bigger disk" off)" || continue
           [[ "$opts" == *verify* ]] && verify=1
@@ -404,7 +404,7 @@ ui_main_menu() {
       restore)
         # Find images, let the user pick one, then ask which disk to write to.
         local -a imgs=()
-        local scan_dir f rt rtgrow rtverify
+        local scan_dir f rt restore_resize=0
         for scan_dir in "$PWD" /mnt /media "$HOME"; do
           [[ -d "$scan_dir" ]] || continue
           while IFS= read -r f; do
@@ -441,11 +441,17 @@ ui_main_menu() {
         else
           local rline
           rline="$(pick_target_2col "$src")" || continue
-          IFS='|' read -r rtag rtgrow rtverify <<< "$rline"
+          IFS='|' read -r rtag _rgrow _rverify <<< "$rline"
           [[ -n "$rtag" ]] || continue
           rt="/dev/$rtag"
+          restore_resize="$_rgrow"
         fi
-        ui_msg "About to write\n\n  $f\n  onto $rt\n\nThe ENTIRE target disk will be overwritten." || continue
+        local rnote="The ENTIRE target disk will be overwritten."
+        if ((restore_resize)); then
+          rnote+="\n\nYou asked to resize, but restore does not resize."
+          rnote+="\nAfter restoring, use Clone > Verify, and grow manually if needed."
+        fi
+        ui_msg "About to write\n\n  $f\n  onto $rt\n\n$rnote" || continue
         ui_yesno "Continue?" || continue
         confirm_typing "$rt" || continue
         _use_curses && clear 2>/dev/null || true

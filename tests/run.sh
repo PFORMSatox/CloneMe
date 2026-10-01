@@ -2,7 +2,7 @@
 # tests/run.sh — no-root test suite for clone-me. Safe: read-only, never writes disks.
 # Run: ./tests/run.sh
 set -uo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit 1
 
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "PASS: $1"; }
@@ -137,6 +137,26 @@ if ((rc != 0)) && [[ ! -e "$DRY_TGT" ]]; then ok "dry-run refuses write, no targ
 DRY_RUN=0 progress_dd "$DRY_SRC" "$DRY_TGT" 1048576 >/dev/null 2>&1 && rc=0 || rc=1
 if ((rc == 0)) && [[ -e "$DRY_TGT" ]]; then ok "normal mode still copies (guard not blanket)"; else bad "normal copy" "rc=$rc"; fi
 rm -rf "$WORK"
+
+echo "== T12: root partition resolution (guards --grow correctness) =="
+srp="$(source_root_part 2>/dev/null || true)"
+if [[ "$srp" =~ ^(p[0-9]+|[0-9]+)$ ]]; then ok "source_root_part=$srp"; else bad "source_root_part" "got '$srp'"; fi
+# every bus naming convention must map the source root onto the target correctly
+while IFS='|' read -r dev want; do
+  [[ -z "$dev" ]] && continue
+  got="$(root_part_of "$dev" 2>/dev/null || true)"
+  if [[ "$got" == "$want" ]]; then ok "root_part_of $dev -> $got"; else bad "root_part_of $dev" "got '$got' want '$want'"; fi
+done <<'CASES'
+/dev/nvme0n1|/dev/nvme0n12
+/dev/sdb|/dev/sdbp2
+/dev/sdc|/dev/sdcp2
+/dev/vdb|/dev/vdbp2
+/dev/mmcblk0|/dev/mmcblk0p2
+/dev/loop3|/dev/loop32
+CASES
+# the old bug: "resizepart 2" hardcoded, and "first ext4" as root
+if grep -qE 'resizepart 2([[:space:]]|$)' lib/common.sh; then bad "hardcoded resizepart 2" "still present"; else ok "no hardcoded 'resizepart 2'"; fi
+if grep -qE "awk '\$2==\"ext4\"'" lib/common.sh; then bad "first-ext4 heuristic" "still used as root"; else ok "root resolved from source, not 'first ext4'"; fi
 
 echo
 echo "RESULT: $PASS passed, $FAIL failed"

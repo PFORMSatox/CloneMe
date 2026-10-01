@@ -25,6 +25,21 @@ All notable changes to CloneMe. Format based on [Keep a Changelog](https://keepa
 
 ## [Unreleased]
 
+### Fixed — data safety in `--grow`
+- `resizepart 2` was hardcoded. On any layout where the last partition is not
+  partition 2 (separate `/home`, `/var`, LVM, etc.) `--grow` resized the **wrong
+  partition**. Now derives the real last partition number.
+- The root filesystem was identified as "the first ext4 partition on the target".
+  On a disk with a separate `/boot` ext4 that is the wrong filesystem, so
+  `e2fsck`/`resize2fs` acted on it. Now resolved from the source's actual `/`
+  partition, which carries over because a clone is byte-identical.
+- A failed `resize2fs` was swallowed by `|| true` — a grow that did not happen
+  looked identical to one that did. Now reported as an error with the fix command.
+- Restore asked for resize/verify options and then silently ignored them. Now
+  states plainly that restore does not resize.
+- `assert_writable` (the `--dry-run` backstop) was bypassed on the `ddrescue`
+  and `zstd` paths. Both now go through it.
+
 ### Added
 - `--dry-run` / `-n`: runs every validation check and prints the exact plan without
   writing to a disk. Backed by `assert_writable`, so no call site can bypass it.

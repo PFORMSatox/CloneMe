@@ -5,7 +5,7 @@
 # Touches ONLY loop devices. Never touches nvme0n1/sdc (guarded).
 # Run: sudo ./tests/root-e2e.sh
 set -euo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit 1
 
 [[ ${EUID} -eq 0 ]] || { echo "Run as root: sudo ./tests/root-e2e.sh"; exit 1; }
 for b in losetup sgdisk mkfs.ext4 e2fsck dd cmp partprobe; do
