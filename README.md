@@ -1,4 +1,4 @@
-<p align="center"><img src="img/CloneMe.jpeg" alt="CloneMe logo" width="160"></p>
+<p align="center"><img src="img/CloneMe-banner.jpeg" alt="CloneMe banner"></p>
 
 # clone-me
 
@@ -59,7 +59,7 @@ After clone: shutdown, unplug source or change boot order, boot target. Do not b
 
 ```text
 clone-me.sh       # entrypoint, APP=clone-me VERSION=0.1.0, usage/help, command dispatch
-img/CloneMe.jpeg  # project logo (used at top of this README)
+img/CloneMe-banner.jpeg  # project banner (used at top of this README)
 lib/common.sh     # sourced logic: detect_source_disk, safety_check, cmd_clone/image/restore/verify, list_disks
 lib/ui.sh         # sourced menu UI: whiptail/dialog with /dev/tty + text fallback
 tests/run.sh      # no-root read-only suite (syntax, detect, sizes, safety, UI helpers)
