@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck util-linux
+
+      - name: shellcheck
+        # Test scripts deliberately source libs with stubs; ignore only those.
+        run: |
+          shellcheck -S warning -e SC1091 \
+            clone-me.sh lib/common.sh lib/ui.sh tests/run.sh tests/root-e2e.sh
+
+      - name: bash -n
+        run: |
+          for f in clone-me.sh lib/*.sh tests/*.sh; do
+            bash -n "$f" && echo "ok: $f"
+          done
+
+      - name: Unit suite (no disk checks)
+        # No /dev/nvme0n1 + /dev/sdc on a runner: disk-specific tests must SKIP, not fail.
+        run: CLONE_TEST_NO_DISK=1 ./tests/run.sh
+
+      - name: Help output
+        run: ./clone-me.sh --help

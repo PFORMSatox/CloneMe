@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# clone-me — menu-based byte-copy of the running disk to an external disk.
+# CloneMe — menu-based byte-copy of the running disk to an external disk.
 # Author: PFORMSatox | License: MIT
 # v1: Bash, whiptail-first menu + CLI backend, equal-or-larger only, best-effort live copy + fsck.
 set -euo pipefail
 
-APP="clone-me"
+APP="CloneMe"
 VERSION="0.1.0"
 LOGDIR="${LOGDIR:-./logs}"
 mkdir -p "$LOGDIR"

@@ -22,17 +22,17 @@ Bash, whiptail-first menu + CLI backend, equal-or-larger only, best-effort live 
 ## Requirements
 
 - System: Linux, root (`sudo`), Bash, GPT-partitioned source disk with ext4 root
-- Mandatory (checked by `check_deps` in `lib/common.sh:14`):
+- Mandatory (checked by `check_deps` in `lib/common.sh`):
   `lsblk blkid dd sgdisk sfdisk partprobe sync e2fsck`
 - Always used (coreutils/util-linux, expected present):
   `findmnt tee date mkdir grep tr awk head cmp sha256sum udevadm`
 - Optional — gracefully degraded if missing:
-  `whiptail` or `dialog` (else text menu in `lib/ui.sh:10`),
-  `ddrescue` (else `dd` in `lib/common.sh`),
+  `whiptail` or `dialog` (else text menu; UI detection in `lib/ui.sh`),
+  `ddrescue` (else `dd`, chosen by `pick_dd`),
   `pv` (progress bar + ETA in clone/image/restore, else `dd status=progress`),
   `zstd` (required for `image`/`restore`),
-  `parted` + `resize2fs` (required for `--grow` in `lib/common.sh:129`)
-- Test-only (`tests/root-e2e.sh:11` + helpers):
+  `parted` + `resize2fs` (required for `--grow`)
+- Test-only (`tests/root-e2e.sh` + helpers):
   `losetup mkfs.ext4 truncate mount umount cmp`
 - Install (Debian/Ubuntu):
   `apt install gdisk fdisk parted e2fsprogs dosfstools zstd gddrescue whiptail pv`
@@ -58,24 +58,61 @@ After clone: shutdown, unplug source or change boot order, boot target. Do not b
 ## Layout
 
 ```text
-clone-me.sh       # entrypoint, APP=clone-me VERSION=0.1.0, usage/help, command dispatch
+clone-me.sh       # entrypoint, APP=CloneMe VERSION=0.1.0, usage/help, command dispatch
 img/CloneMe-banner.jpeg  # project banner (used at top of this README)
 lib/common.sh     # sourced logic: detect_source_disk, safety_check, cmd_clone/image/restore/verify, list_disks
-lib/ui.sh         # sourced menu UI: whiptail/dialog with /dev/tty + text fallback
-tests/run.sh      # no-root read-only suite (syntax, detect, sizes, safety, UI helpers)
+lib/ui.sh         # sourced menu UI: whiptail/dialog with /dev/tty + text fallback, disk picker
+tests/run.sh      # no-root read-only suite (syntax, detect, sizes, safety, UI helpers, picker, cancel paths)
 tests/root-e2e.sh # full clone dry-run on loop devices (120M src → 200M dst, marker + GPT asserts)
-logs/             # per-run logs: clone-me-YYYY-MM-DD_HHMMSS.log
+docs/plans/       # implementation plans and review notes
+logs/             # per-run logs: clone-me-YYYY-MM-DD_HHMMSS.log (git-ignored)
 ```
 
 `CLONE_SRC_OVERRIDE=/dev/loopX` forces the source (used by e2e). Logs tee stdout/stderr; dialogs use `/dev/tty` so curses is never garbled.
 
+## Menu UI
+
+Pick **Clone whole disk to external** to get the disk picker:
+
+- **Curses** (`whiptail`/`dialog`): arrow-key radiolists, then an options checklist.
+- **Text** (no curses): one two-column screen — target list on the left, options on
+  the right, source locked and shown as `[SOURCE — locked]`. Keys: `↑↓`/`jk` move,
+  `Tab`/`←→`/`hl` switch column, `Space` toggles a checkbox, `Enter` confirms,
+  `Esc`/`q` cancels.
+
+**You can always back out.** Every step has an exit:
+
+| Step | Curses | Text |
+|------|--------|------|
+| Pick target | `— Exit without cloning —` row, `Esc` = back | `0` / `q` / `Enter` |
+| Options | `Esc` = back | `0` = cancel |
+| Final confirm | `Yes` / `Go back` / `Exit` buttons | Enter = go back |
+
+The source is always locked: it is the running disk, so it can never be chosen as
+the copy target. Disks smaller than the source are shown as `[too small]` and cannot
+be selected.
+
 ## Testing
 
 ```bash
-./tests/run.sh          # safe, read-only, no root (expects /dev/nvme0n1 + /dev/sdc on dev host)
-sudo ./tests/root-e2e.sh # loop-device clone, touches only /dev/loop*, refuses nvme/sd/vd/hd
-bash -n clone-me.sh lib/common.sh lib/ui.sh  # syntax
+./tests/run.sh                 # safe, read-only, no root
+sudo ./tests/root-e2e.sh       # loop-device clone, touches only /dev/loop*, refuses nvme/sd/vd/hd
+bash -n clone-me.sh lib/*.sh tests/*.sh   # syntax
 ```
+
+`tests/run.sh` checks disk-specific facts (detected source, exact sizes, safety
+rejections against the real target) only when `/dev/nvme0n1` **and** `/dev/sdc` both
+exist. On any other machine, or in CI, those checks report `SKIP` instead of failing:
+
+```bash
+CLONE_TEST_NO_DISK=1 ./tests/run.sh        # or in CI
+CLONE_TEST_SRC=/dev/sda CLONE_TEST_TGT=/dev/sdb CLONE_TEST_SRC_BYTES=... \
+  CLONE_TEST_TGT_BYTES=... ./tests/run.sh   # or assert your own disks
+```
+
+CI (`.github/workflows/ci.yml`) runs shellcheck, `bash -n`, and `tests/run.sh` in
+no-disk mode on every push. `tests/root-e2e.sh` is not run in CI — it needs root and
+`losetup`, so run it locally before trusting a clone.
 
 ## Limitations (v1)
 

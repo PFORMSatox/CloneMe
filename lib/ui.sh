@@ -87,7 +87,7 @@ _dlg() {
 }
 
 ui_msg() { # $1 text — display to stderr (never captured), works piped ortty
-  if _use_curses; then _dlg --title "clone-me" --msgbox "$1" $UI_H $UI_W;
+  if _use_curses; then _dlg --title "CloneMe" --msgbox "$1" $UI_H $UI_W;
   else printf '\n%s\n' "$1" >&2; fi
 }
 
@@ -103,7 +103,7 @@ ui_menu() { # $1 title, rest tag/item pairs -> echoes tag to stdout
     [[ "$ans" =~ ^[0-9]+$ ]] && (( ans >= 1 && ans <= max )) || { echo "invalid" >&2; return 1; }
     echo "${tags[$((ans-1))]}"
   else
-    _dlg --title "clone-me" --menu "$title" $UI_H $UI_W 10 "$@"
+    _dlg --title "CloneMe" --menu "$title" $UI_H $UI_W 10 "$@"
   fi
 }
 
