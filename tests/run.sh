@@ -70,6 +70,12 @@ echo "== T8: progress + timer helpers =="
 if command -v pv >/dev/null 2>&1; then want_progress="pv"; else want_progress="dd"; fi
 [[ "$(pick_progress 2>/dev/null)" == "$want_progress" ]] && ok "pick_progress=$want_progress" || bad "pick_progress" "missing or wrong"
 
+echo "== T9: two-column picker (plain path, piped) =="
+line="$(printf '1\nn\ny\n' | pick_target_2col /dev/nvme1n1 2>/dev/null)" && rc=0 || rc=1
+if ((rc == 0)) && [[ "$line" =~ ^[A-Za-z0-9_.-]+\|[01]\|[01]$ ]]; then ok "picker line=$line"; else bad "picker" "rc=$rc line='$line'"; fi
+if printf '9\n' | pick_target_2col /dev/nvme1n1 2>/dev/null >/dev/null; then bad "picker-badchoice" "accepted"; else ok "picker bad choice rejected"; fi
+if tgt_eligible "" /dev/nvme1n1 /dev/nvme1n1 2>/dev/null; then bad "picker-samedisk" "accepted"; else ok "picker same-disk rejected"; fi
+
 echo
 echo "RESULT: $PASS passed, $FAIL failed"
 exit "$((FAIL > 0))"

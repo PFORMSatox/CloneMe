@@ -164,6 +164,148 @@ confirm_typing() {
   fi
 }
 
+# Text-mode two-column target picker. $1 = locked source (/dev/…).
+# stdout: TAG|GROW|VERIFY, all chrome on stderr, keys from /dev/tty.
+# Curses is NOT handled here: the existing sequential radiolists are already
+# arrow-driven, and newt/dialog have no side-by-side widget. The source stays
+# locked (it is the running disk — choosing otherwise would pass
+# safety_check yet clone the wrong disk). cmd_clone still re-validates.
+# NOTE: this file runs under `set -e` — no bare ((expr)) statements.
+pick_target_2col() {
+  local src="$1"
+  _use_curses && return 1
+  if [[ -t 0 ]]; then pick_2col_tty_real "$src"
+  else pick_2col_plain_real "$src"; fi
+}
+
+tgt_eligible() { # $1 src_bytes(or empty) $2 candidate /dev/… -> 0 when selectable
+  local sb="$1" dev="$2" tb
+  [[ "$dev" == "$3" ]] && return 1
+  tb="$(disk_bytes "$dev")"
+  if [[ -n "$sb" && -n "$tb" ]]; then
+    ((tb >= sb)) || return 1
+  elif [[ -z "$tb" ]]; then
+    return 1
+  fi
+  return 0
+}
+
+# globals for ti_step (bash has no pass-by-reference for the navigator)
+SB=""; SRC=""; ROWS=()
+
+pick_2col_tty_real() {
+  local src="$1"
+  local -a rows=()
+  local d
+  while read -r d; do [[ -n "$d" ]] && rows+=("$d"); done < <(lsblk -dnro NAME -e7,254)
+  if (( ${#rows[@]} == 0 )); then echo "No disks found." >&2; return 1; fi
+  local n=${#rows[@]} ti=-1 zone=1 oi=0 grow=0 verify=1 err=""
+  local i key rest sb tag
+  sb="$(disk_bytes "$src")"
+  for ((i=0; i<n; i++)); do
+    if tgt_eligible "$sb" "/dev/${rows[$i]}" "$src"; then ti=$i; break; fi
+  done
+  if ((ti < 0)); then echo "No equal-or-larger target disk found." >&2; return 1; fi
+  SB="$sb"; SRC="$src"; ROWS=("${rows[@]}")
+  tput civis 2>/dev/null >&2 || true
+  trap 'tput cnorm 2>/dev/null >&2 || true' INT TERM
+  while true; do
+    printf '\n━━ CloneMe — pick TARGET (source %s is locked) ━━\n' "$src" >&2
+    printf 'SOURCE (this machine, NEVER wiped): %s  %s\n' "$src" "$(disk_line "$src" 2>/dev/null)" >&2
+    if ((zone == 1)); then
+      printf '%-42s %-36s\n' "  TARGET (will be FULLY wiped) <<" "OPTIONS" >&2
+    else
+      printf '%-42s %-36s\n' "  TARGET (will be FULLY wiped)" "OPTIONS <<" >&2
+    fi
+    for ((i=0; i<n; i++)); do
+      left="  ${rows[$i]}  $(disk_line "/dev/${rows[$i]}" 2>/dev/null)"
+      right="$left"
+      if [[ "/dev/${rows[$i]}" == "$src" ]]; then left="$left  [SOURCE — locked]"; fi
+      if ((i == ti)); then left="$left  (target)"; fi
+      if [[ "/dev/${rows[$i]}" == "$src" ]]; then right="$right  (source)"
+      elif ! tgt_eligible "$sb" "/dev/${rows[$i]}" "$src"; then right="$right  (too small)"
+      elif ((zone == 1 && i == ti)); then right="> ${right#  }"
+      else right="  $right"; fi
+      printf '%-42.42s %-36s\n' "$left" "$right" >&2
+    done
+    if ((grow)); then lopt="[x]"; else lopt="[ ]"; fi
+    if ((verify)); then copt="[x]"; else copt="[ ]"; fi
+    if ((zone == 2 && oi == 0)); then lopt="> $lopt"; else lopt="  $lopt"; fi
+    if ((zone == 2 && oi == 1)); then copt="> $copt"; else copt="  $copt"; fi
+    printf '%-42s %s Resize cloned disk to fill target space\n' "" "$lopt" >&2
+    printf '%-42s %s Verify after copy\n' "" "$copt" >&2
+    if [[ -n "$err" ]]; then printf '  !! %s\n' "$err" >&2; err=""; fi
+    printf '  ↑↓ move · Tab/←→ switch · Space toggle · Enter confirm · q abort\n' >&2
+    printf '  Target must be equal or larger than source. The ENTIRE target is overwritten.\n' >&2
+    IFS= read -rsn1 key </dev/tty || { trap - INT TERM; tput cnorm 2>/dev/null >&2 || true; return 1; }
+    case "$key" in
+      $'\x1b')
+        read -rsn2 -t 0.2 rest </dev/tty || { trap - INT TERM; tput cnorm 2>/dev/null >&2 || true; return 1; }
+        case "$rest" in
+          '[A'|'OA') if ((zone == 2)); then oi=$(((oi + 1) % 2)); else ti_step "$n" -1; fi ;;
+          '[B'|'OB') if ((zone == 2)); then oi=$(((oi + 1) % 2)); else ti_step "$n" 1; fi ;;
+          '[C'|'[D') if ((zone == 1)); then zone=2; else zone=1; fi ;;
+        esac ;;
+      $'\t') if ((zone == 1)); then zone=2; else zone=1; fi ;;
+      ' ') if ((zone == 2)); then
+             if ((oi == 0)); then grow=$(((grow + 1) % 2)); else verify=$(((verify + 1) % 2)); fi
+           fi ;;
+      $'h'|$'H') zone=1 ;;
+      $'l'|$'L') zone=2 ;;
+      $'j'|$'J') if ((zone == 2)); then oi=$(((oi + 1) % 2)); else ti_step "$n" 1; fi ;;
+      $'k'|$'K') if ((zone == 2)); then oi=$(((oi + 1) % 2)); else ti_step "$n" -1; fi ;;
+      $'q'|$'Q') trap - INT TERM; tput cnorm 2>/dev/null >&2 || true; return 1 ;;
+      '')
+        tag="${rows[$ti]}"
+        if [[ "/dev/$tag" == "$src" ]]; then err="that is the SOURCE — it is locked"; continue; fi
+        if ! tgt_eligible "$(disk_bytes "$src")" "/dev/$tag" "$src"; then err="target smaller than source — equal-or-larger only"; continue; fi
+        trap - INT TERM; tput cnorm 2>/dev/null >&2 || true
+        printf '%s|%s|%s\n' "$tag" "$grow" "$verify"
+        return 0 ;;
+    esac
+  done
+}
+
+ti_step() { # $1 count $2 delta — move global ti to next eligible row (wrap)
+  local n="$1" dlt="$2" i guard=0
+  while ((guard < n)); do
+    guard=$((guard + 1))
+    ti=$(((ti + n + dlt) % n))
+    if tgt_eligible "$SB" "/dev/${ROWS[$ti]}" "$SRC"; then break; fi
+  done
+  return 0
+}
+
+pick_2col_plain_real() { # numbered fallback; stdout: TAG|GROW|VERIFY
+  local src="$1"
+  local -a rows=()
+  local d
+  while read -r d; do [[ -n "$d" ]] && rows+=("$d"); done < <(lsblk -dnro NAME -e7,254)
+  if (( ${#rows[@]} == 0 )); then echo "No disks found." >&2; return 1; fi
+  local n=${#rows[@]} i ans rsz vfy sb
+  local -a tidx=()
+  sb="$(disk_bytes "$src")"
+  printf 'SOURCE (locked, never wiped): %s  %s\n' "$src" "$(disk_line "$src" 2>/dev/null)" >&2
+  printf 'TARGET candidates (equal-or-larger only):\n' >&2
+  for ((i=0; i<n; i++)); do
+    if ! tgt_eligible "$sb" "/dev/${rows[$i]}" "$src"; then
+      printf '  --) %s  %s  [%s]\n' "${rows[$i]}" "$(disk_line "/dev/${rows[$i]}" 2>/dev/null)" "$([[ "/dev/${rows[$i]}" == "$src" ]] && echo locked || echo "too small")" >&2
+      continue
+    fi
+    tidx+=("$i")
+    printf '  %d) %s  %s\n' "${#tidx[@]}" "${rows[$i]}" "$(disk_line "/dev/${rows[$i]}" 2>/dev/null)" >&2
+  done
+  if (( ${#tidx[@]} == 0 )); then echo "No equal-or-larger target disk found." >&2; return 1; fi
+  read -rp "Pick TARGET [1-${#tidx[@]}]: " ans >&2 || return 1
+  if [[ "$ans" =~ ^[0-9]+$ ]] && ((ans >= 1 && ans <= ${#tidx[@]})); then i="${tidx[$((ans-1))]}"
+  else return 1; fi
+  read -rp "Resize cloned disk to fill target space? [y/N]: " rsz >&2 || return 1
+  read -rp "Verify after copy? [Y/n]: " vfy >&2 || return 1
+  if [[ "$rsz" =~ ^[Yy]$ ]]; then rsz=1; else rsz=0; fi
+  if [[ "$vfy" =~ ^[Nn]$ ]]; then vfy=0; else vfy=1; fi
+  printf '%s|%s|%s\n' "${rows[$i]}" "$rsz" "$vfy"
+}
+
 ui_main_menu() {
   require_root; check_deps; detect_ui
   local src tgt
@@ -187,15 +329,22 @@ ui_main_menu() {
           else lbl="$(disk_line "/dev/$d")"; fi
           menu_args+=("$d" "$lbl")
         done < <(lsblk -dnro NAME -e7,254)
-        local t opts
-        t="$(ui_menu "Step 1/3 — pick TARGET (wiped)" "${menu_args[@]}")" || continue
-        [[ -z "$t" ]] && continue
-        [[ "/dev/$t" == "$src" ]] && { ui_msg "That is the SOURCE. It is locked."; continue; }
-        tgt="/dev/$t"
-        opts="$(ui_checklist "Step 2/3 — options" verify "Re-verify after copy" on grow "Expand to fill bigger disk" off)" || continue
-        local verify=0 grow=0
-        [[ "$opts" == *verify* ]] && verify=1
-        [[ "$opts" == *grow* ]] && grow=1
+        local t opts line verify=0 grow=0
+        if _use_curses; then
+          t="$(ui_menu "Step 1/3 — pick TARGET (wiped)" "${menu_args[@]}")" || continue
+          [[ -z "$t" ]] && continue
+          [[ "/dev/$t" == "$src" ]] && { ui_msg "That is the SOURCE. It is locked."; continue; }
+          tgt="/dev/$t"
+          opts="$(ui_checklist "Step 2/3 — options" verify "Re-verify after copy" on grow "Expand to fill bigger disk" off)" || continue
+          [[ "$opts" == *verify* ]] && verify=1
+          [[ "$opts" == *grow* ]] && grow=1
+        else
+          # text mode: two-column picker (target + resize/verify on one screen)
+          line="$(pick_target_2col "$src")" || continue
+          IFS='|' read -r t grow verify <<< "$line"
+          [[ -n "$t" ]] || continue
+          tgt="/dev/$t"
+        fi
         ui_yesno "Step 3/3 — clone?\n\n$src\n  → $tgt\n\nverify=$verify grow=$grow" || continue
         confirm_typing "$tgt" || continue
         _use_curses && clear 2>/dev/null || true
