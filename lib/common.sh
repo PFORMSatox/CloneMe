@@ -20,7 +20,7 @@ check_deps() {
   fi
 }
 
-# Prints "/dev/nvme0n1" style source disk for '/'.
+# Prints the whole-disk device that backs '/' (e.g. /dev/nvme0n1, /dev/sda).
 # CLONE_SRC_OVERRIDE=/dev/loopX forces the source (used by tests/root-e2e.sh).
 detect_source_disk() {
   if [[ -n "${CLONE_SRC_OVERRIDE:-}" ]]; then echo "$CLONE_SRC_OVERRIDE"; return; fi
@@ -51,25 +51,33 @@ safety_check() {
   local src="$1" tgt="$2"
   # NOTE: return (not exit) so the menu survives a rejection and tests can assert.
   # Under `set -e` a bare failing call still aborts CLI mode — same safety.
-  [[ -b "$src" ]] || { echo "ERROR: source $src not a block device"; return 1; }
-  [[ -b "$tgt" ]] || { echo "ERROR: target $tgt not a block device (check /dev/sdc spelling)"; return 1; }
-  [[ "$src" == "$tgt" ]] && { echo "ERROR: target == source. Refusing."; return 1; }
+  # Diagnostics go to stderr so stdout stays clean for piping/logging.
+  [[ -b "$src" ]] || { echo "ERROR: source $src not a block device" >&2; return 1; }
+  [[ -b "$tgt" ]] || { echo "ERROR: target $tgt not a block device (check the spelling, e.g. /dev/sdb)" >&2; return 1; }
+  [[ "$src" == "$tgt" ]] && { echo "ERROR: target == source. Refusing." >&2; return 1; }
   # target must not be a partition of source and vice versa
-  if [[ "$tgt" == "$src"* ]]; then echo "ERROR: target $tgt looks like a partition of source $src. Use whole disk /dev/nvme0n1."; return 1; fi
-  if target_mounted "$tgt"; then echo "ERROR: target $tgt has mounted partitions. Unmount first."; lsblk "$tgt"; return 1; fi
+  if [[ "$tgt" == "$src"* ]]; then echo "ERROR: target $tgt looks like a partition of source $src. Use the whole disk, $src." >&2; return 1; fi
+  if target_mounted "$tgt"; then echo "ERROR: target $tgt has mounted partitions. Unmount first." >&2; lsblk "$tgt" >&2; return 1; fi
   local sb tb
   sb="$(disk_bytes "$src")"; tb="$(disk_bytes "$tgt")"
-  [[ -n "$sb" && -n "$tb" ]] || { echo "ERROR: cannot read sizes"; return 1; }
-  (( tb >= sb )) || { echo "ERROR: target $tb bytes < source $sb bytes. Equal-or-larger only in v1."; return 1; }
-  echo "OK: source $src ($sb bytes) -> target $tgt ($tb bytes)"
+  [[ -n "$sb" && -n "$tb" ]] || { echo "ERROR: cannot read sizes" >&2; return 1; }
+  (( tb >= sb )) || { echo "ERROR: target $tb bytes < source $sb bytes. Target must be equal or larger." >&2; return 1; }
+  echo "OK: source $src ($sb bytes) -> target $tgt ($tb bytes)" >&2
 }
 
-confirm_typing() {
-  local tgt="$1" base
-  base="$(basename "$tgt")"
-  echo "!!! ALL DATA ON $tgt WILL BE DESTROYED !!!"
-  read -rp "Type the disk name to confirm (e.g. $base): " ans
-  [[ "$ans" == "$base" ]] || { echo "Aborted."; return 1; }
+# confirm_typing() lives in lib/ui.sh (curses + text variants). It is defined
+# there, not here — lib/ui.sh is sourced at the bottom of this file.
+
+# Dry-run support: DRY_RUN=1 (set by --dry-run/-n) must never write a disk.
+dry_run() { [[ "${DRY_RUN:-0}" == "1" ]]; }
+
+# Guard for anything that writes to a device. Any future call site is covered.
+assert_writable() {
+  if dry_run; then
+    echo "DRY-RUN: refusing to write to $1" >&2
+    return 1
+  fi
+  return 0
 }
 
 pick_dd() {
@@ -94,6 +102,7 @@ timer_show() { # $1 start_epoch $2 label -> "label: HH:MM:SS elapsed"
 }
 
 progress_dd() { # $1=src $2=dst $3=size_bytes — pv bar when available, else dd progress
+  assert_writable "$2" || return 1
   if [[ "$(pick_progress)" == "pv" && -n "${3:-}" ]]; then
     pv -s "$3" "$1" | dd of="$2" bs=64K oflag=direct conv=fsync status=none
   else
@@ -118,12 +127,23 @@ cmd_clone() {
     --grow) grow=1; shift ;;
     *) echo "Unknown flag $1"; exit 1 ;;
   esac; done
-  [[ -n "$target" ]] || { echo "Usage: clone --target /dev/sdX [--yes] [--verify] [--grow]"; exit 1; }
+  [[ -n "$target" ]] || { echo "Usage: clone --target /dev/sdX [--yes] [--verify] [--grow]" >&2; exit 1; }
   require_root; check_deps
   local src; src="$(detect_source_disk)"
   echo "Source (auto, whole disk): $src"
   blkid "$src"* 2>/dev/null || true
   safety_check "$src" "$target"
+  if dry_run; then
+    echo "--- DRY RUN: nothing will be written to $target ---" >&2
+    echo "Plan:" >&2
+    echo "  1. byte-copy whole disk $src -> $target ($(disk_bytes "$src") bytes)" >&2
+    echo "  2. sgdisk -e  (move GPT backup header to end of target)" >&2
+    echo "  3. e2fsck -fy on the target ext4 partition" >&2
+    ((grow)) && echo "  4. parted resizepart + resize2fs (--grow)" >&2
+    ((verify)) && echo "  5. verify: sgdisk -v + 100M cmp + e2fsck -n" >&2
+    echo "All checks above passed. Re-run without --dry-run to perform it." >&2
+    return 0
+  fi
   ((yes)) || confirm_typing "$target"
 
   echo "--- step 1/4: byte copy whole disk ($src -> $target) ---"
@@ -178,6 +198,12 @@ cmd_image() {
   command -v zstd >/dev/null || { echo "ERROR: install zstd"; exit 1; }
   local src; src="$(detect_source_disk)"
   echo "Imaging $src -> $to"
+  if dry_run; then
+    echo "--- DRY RUN: no image will be written ---" >&2
+    echo "  would write $to plus .sfdisk/.blkid/.gpt.txt/.sha256 manifests" >&2
+    echo "  source: $src ($(disk_bytes "$src") bytes)" >&2
+    return 0
+  fi
   sfdisk -d "$src" > "$to.sfdisk"; blkid "$src"* > "$to.blkid" 2>/dev/null || true
   sgdisk -p "$src" > "$to.gpt.txt"
   sync
@@ -201,6 +227,11 @@ cmd_restore() {
   require_root; check_deps
   local src; src="$(detect_source_disk)"
   safety_check "$src" "$target"
+  if dry_run; then
+    echo "--- DRY RUN: nothing will be written to $target ---" >&2
+    echo "  would restore $from -> $target, then partprobe" >&2
+    return 0
+  fi
   ((yes)) || confirm_typing "$target"
   t0="$(timer_start)"
   case "$from" in

@@ -128,6 +128,16 @@ if printf '9\n' | pick_2col_plain_real /dev/nvme1n1 2>/dev/null >/dev/null; then
 # no eligible target (source is the largest disk) must refuse, not crash
 if printf '1\n' | pick_2col_plain_real /dev/nvme0n1 2>/dev/null >/dev/null; then bad "no-eligible-target" "accepted"; else ok "no eligible target rejected"; fi
 
+echo "== T11: --dry-run write backstop =="
+WORK="$(mktemp -d /tmp/clone-me-dryrun.XXXXXX)"
+DRY_SRC="$WORK/src.img"; DRY_TGT="$WORK/tgt.img"
+truncate -s 1M "$DRY_SRC"
+DRY_RUN=1 progress_dd "$DRY_SRC" "$DRY_TGT" 1048576 >/dev/null 2>&1 && rc=0 || rc=1
+if ((rc != 0)) && [[ ! -e "$DRY_TGT" ]]; then ok "dry-run refuses write, no target created"; else bad "dry-run guard" "rc=$rc exists=$([[ -e $DRY_TGT ]] && echo yes || echo no)"; fi
+DRY_RUN=0 progress_dd "$DRY_SRC" "$DRY_TGT" 1048576 >/dev/null 2>&1 && rc=0 || rc=1
+if ((rc == 0)) && [[ -e "$DRY_TGT" ]]; then ok "normal mode still copies (guard not blanket)"; else bad "normal copy" "rc=$rc"; fi
+rm -rf "$WORK"
+
 echo
 echo "RESULT: $PASS passed, $FAIL failed"
 exit "$((FAIL > 0))"

@@ -320,7 +320,7 @@ ui_main_menu() {
   local src tgt
   src="$(detect_source_disk)"
   tgt="$(suggest_target "$src")"
-  ui_msg "SOURCE (this machine)\n  $src  $(disk_line "$src")\n\nSUGGESTED TARGET\n  ${tgt:-none found}  $([[ -n "$tgt" ]] && disk_line "$tgt")\n\nNote: /dev/nvme0n1p1 is only the 1G EFI partition.\nA bootable clone copies the WHOLE disk ($src).\n\n$CFOOT"
+  ui_msg "SOURCE (this machine)\n  $src  $(disk_line "$src")\n\nSUGGESTED TARGET\n  ${tgt:-none found}  $([[ -n "$tgt" ]] && disk_line "$tgt")\n\nA bootable clone copies the WHOLE disk ($src), not just a partition of it.\n\n$CFOOT"
   while true; do
     local c
     c="$(ui_menu "Source $src → Target ${tgt:-?}" \
@@ -372,12 +372,106 @@ ui_main_menu() {
         else ui_msg "Clone FAILED. See log: $LOG"; fi
         ;;
       image)
-        ui_msg "Image mode writes a compressed file.\nUse CLI to choose path:\n  sudo ./clone-me.sh image --to /mnt/usb/backup.img.zst --verify" ;;
+        # Ask where to save, then actually run it — no "use the CLI" dead end.
+        command -v zstd >/dev/null 2>&1 || { ui_msg "Saving an image needs zstd.\n\nInstall it with:\n  sudo apt install zstd"; continue; }
+        local ipath idir avail
+        ipath="$(ui_input "Save the compressed image to (full path):")" || continue
+        [[ -z "$ipath" ]] && continue
+        case "$ipath" in
+          /*) ;;
+          *) ipath="$PWD/$ipath" ;;
+        esac
+        [[ "$ipath" != *.zst ]] && ipath="${ipath}.img.zst"
+        if [[ -e "$ipath" ]]; then
+          ui_yesno "$ipath already exists.\n\nOverwrite it?" || continue
+        fi
+        idir="$(dirname "$ipath")"
+        if [[ ! -d "$idir" ]]; then
+          ui_yesno "Folder does not exist:\n  $idir\n\nCreate it and continue?" || continue
+          mkdir -p "$idir" || { ui_msg "Could not create $idir"; continue; }
+        fi
+        avail="$(df -h --output=avail "$idir" 2>/dev/null | tail -n 1 | tr -d ' ')"
+        ui_msg "Image of $src\n\n  source size: $(disk_bytes "$src") bytes\n  free space:  ${avail:-unknown}\n\nSaving may take a while. The image can be restored later from the Restore menu." \
+          || continue
+        ui_yesno "Start now?" || continue
+        _use_curses && clear 2>/dev/null || true
+        printf '\n━━ imaging %s -> %s ━━\n' "$src" "$ipath"
+        if cmd_image --to "$ipath" --verify; then
+          ui_msg "Image saved.\n\n  $ipath\n  plus .sfdisk / .blkid / .gpt.txt / .sha256 manifests\n\nRestore it later with the Restore menu."
+        else
+          ui_msg "Image FAILED. See log: $LOG"
+        fi ;;
       restore)
-        ui_msg "Restore needs an explicit file.\nUse CLI:\n  sudo ./clone-me.sh restore --from X.img.zst --target /dev/sdX --yes" ;;
+        # Find images, let the user pick one, then ask which disk to write to.
+        local -a imgs=()
+        local scan_dir f rt rtgrow rtverify
+        for scan_dir in "$PWD" /mnt /media "$HOME"; do
+          [[ -d "$scan_dir" ]] || continue
+          while IFS= read -r f; do
+            [[ -f "$f" ]] && imgs+=("$f")
+          done < <(find "$scan_dir" -maxdepth 3 -type f \( -name '*.img.zst' -o -name '*.zst' \) 2>/dev/null)
+        done
+        if ((${#imgs[@]} == 0)); then
+          ui_msg "No images found in $PWD, /mnt, /media or $HOME.\n\nGive a full path to continue."
+          f="$(ui_input "Full path to an image (blank to cancel):")" || continue
+          [[ -f "$f" ]] && imgs+=("$f") || { ui_msg "Not a file: $f"; continue; }
+        fi
+        if ((${#imgs[@]} == 1)); then
+          f="${imgs[0]}"
+          ui_msg "Found one image:\n  $f"
+        else
+          local -a imenu=()
+          local idx=0
+          for f in "${imgs[@]}"; do imenu+=("$idx" "$f"); ((idx++)); done
+          idx="$(ui_menu "Restore — which image?" "${imenu[@]}")" || continue
+          [[ -z "$idx" ]] && continue
+          f="${imgs[$idx]}"
+        fi
+        if _use_curses; then
+          local -a rmenu=()
+          local rd
+          while read -r rd; do
+            [[ "/dev/$rd" == "$src" ]] && continue
+            rmenu+=("$rd" "$(disk_line "/dev/$rd")")
+          done < <(lsblk -dnro NAME -e7,254)
+          if ((${#rmenu[@]} == 0)); then ui_msg "No spare disk to restore onto."; continue; fi
+          rd="$(ui_menu "Restore — which target disk? (will be FULLY overwritten)" "${rmenu[@]}")" || continue
+          [[ -z "$rd" ]] && continue
+          rt="/dev/$rd"
+        else
+          local rline
+          rline="$(pick_target_2col "$src")" || continue
+          IFS='|' read -r rtag rtgrow rtverify <<< "$rline"
+          [[ -n "$rtag" ]] || continue
+          rt="/dev/$rtag"
+        fi
+        ui_msg "About to write\n\n  $f\n  onto $rt\n\nThe ENTIRE target disk will be overwritten." || continue
+        ui_yesno "Continue?" || continue
+        confirm_typing "$rt" || continue
+        _use_curses && clear 2>/dev/null || true
+        printf '\n━━ restoring %s -> %s ━━\n' "$f" "$rt"
+        if cmd_restore --from "$f" --target "$rt" --yes; then
+          ui_msg "Restore finished.\n\nReboot and boot from $rt.\n\nThe restored disk has the same UUIDs as the original — do not keep both attached."
+        else
+          ui_msg "Restore FAILED. See log: $LOG"
+        fi ;;
       verify)
-        cmd_verify --target "${tgt:-/dev/sdc}"
-        ui_msg "Verify done. See log: $LOG" ;;
+        # Never guess a device: ask which target to verify against.
+        local vt="${tgt:-}" vmenu=() v
+        while read -r d; do
+          [[ -n "$d" ]] || continue
+          [[ "/dev/$d" == "$src" ]] && continue
+          vmenu+=("$d" "$(disk_line "/dev/$d")")
+        done < <(lsblk -dnro NAME -e7,254)
+        if ((${#vmenu[@]} == 0)); then
+          ui_msg "No other disk to verify against. Only the source ($src) is present.\n\nPlug in the clone, then run Verify again."
+        else
+          v="$(ui_menu "Verify — which disk is the clone?" "${vmenu[@]}")" || continue
+          [[ -z "$v" ]] && continue
+          vt="/dev/$v"
+          cmd_verify --target "$vt"
+          ui_msg "Verify done for $vt. See log: $LOG"
+        fi ;;
       disks)
         list_disks
         read -rp "press enter… " _ ;;

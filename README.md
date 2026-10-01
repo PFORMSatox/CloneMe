@@ -51,6 +51,23 @@ sudo ./clone-me.sh verify --target /dev/sdX
 sudo ./clone-me.sh list               # show disks
 ```
 
+Global flags, accepted before or after the command:
+
+| Flag | Effect |
+|------|--------|
+| `-n`, `--dry-run` | Run every check, print the exact plan, **never write to a disk** |
+| `-V`, `--version` | Print version and exit |
+| `-h`, `--help` | Print help and exit |
+
+Try the dry run first — it is the safe way to check a target before committing:
+
+```bash
+sudo ./clone-me.sh clone --dry-run --target /dev/sdX
+```
+
+When output is piped or redirected, stdout and stderr stay separate (so `2>/dev/null`
+works). Running interactively tees everything to `logs/clone-me-<timestamp>.log`.
+
 Menu flow: pick target (source locked) → options (verify/grow) → confirm → clone.
 
 After clone: shutdown, unplug source or change boot order, boot target. Do not boot long-term with both same-UUID disks attached.
@@ -71,6 +88,15 @@ logs/             # per-run logs: clone-me-YYYY-MM-DD_HHMMSS.log (git-ignored)
 `CLONE_SRC_OVERRIDE=/dev/loopX` forces the source (used by e2e). Logs tee stdout/stderr; dialogs use `/dev/tty` so curses is never garbled.
 
 ## Menu UI
+
+All six menu items do real work from the GUI — none of them tell you to go use the CLI:
+
+- **Clone whole disk to external** — the disk picker below, then copy
+- **Save compressed image file** — asks for a path, shows free space, writes the image
+- **Restore image file to disk** — finds `*.img.zst` under the cwd, `/mnt`, `/media`, `$HOME`
+  and lets you pick one plus a target disk
+- **Verify a clone** — asks which disk is the clone (never guesses a device)
+- **Show disks** / **Exit**
 
 Pick **Clone whole disk to external** to get the disk picker:
 

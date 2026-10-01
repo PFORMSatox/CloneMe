@@ -23,6 +23,24 @@ All notable changes to CloneMe. Format based on [Keep a Changelog](https://keepa
   clone with marker and GPT assertions).
 - GitHub Actions CI: shellcheck, `bash -n`, and the no-root suite.
 
+## [Unreleased]
+
+### Added
+- `--dry-run` / `-n`: runs every validation check and prints the exact plan without
+  writing to a disk. Backed by `assert_writable`, so no call site can bypass it.
+- `--version` / `-V`.
+- `image` and `restore` are now fully usable from the menu (they previously only
+  printed "use the CLI").
+- `verify` asks which disk to check instead of silently defaulting to `/dev/sdc`.
+
+### Fixed
+- Errors from `safety_check` went to stdout, polluting piped output. Now stderr.
+- `confirm_typing` was defined twice; the `common.sh` copy was dead code. Removed.
+- Hardcoded dev-asset names (`/dev/nvme0n1p1`, `/dev/sdc`) appeared in messages shown
+  to every user. Now derived from the actual disks.
+- The global `tee` merged stderr into stdout, so `2>/dev/null` did nothing. The tee is
+  now applied only when running interactively.
+
 ### Known limitations
 - Equal-or-larger targets only.
 - Live root copy is best-effort; `fsck` runs after, verify before trusting it.
