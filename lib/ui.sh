@@ -107,10 +107,10 @@ ui_menu() { # $1 title, rest tag/item pairs -> echoes tag to stdout
   fi
 }
 
-ui_yesno() { # $1 text -> 0=yes
+ui_yesno() { # $1 text -> 0=yes, 1=no/cancel, 255=Exit button
   if ! _use_curses; then
-    local a; printf '\n%s [y/N]: ' "$1" >&2; read -r a; [[ "$a" =~ ^[Yy]$ ]]
-  else _dlg --title "confirm" --yesno "$1" 12 $UI_W; fi
+    local a; printf '\n%s [y/N, Enter = go back]: ' "$1" >&2; read -r a; [[ "$a" =~ ^[Yy]$ ]]
+  else _dlg --title "confirm" --cancel-button "Exit" --yes-button "Yes" --no-button "Go back" --yesno "$1" 12 $UI_W; fi
 }
 
 ui_input() { # $1 prompt -> echoes answer to stdout
@@ -235,12 +235,13 @@ pick_2col_tty_real() {
     printf '%-42s %s Resize cloned disk to fill target space\n' "" "$lopt" >&2
     printf '%-42s %s Verify after copy\n' "" "$copt" >&2
     if [[ -n "$err" ]]; then printf '  !! %s\n' "$err" >&2; err=""; fi
-    printf '  ↑↓ move · Tab/←→ switch · Space toggle · Enter confirm · q abort\n' >&2
+    printf '  [Enter] confirm      [Esc] cancel      ↑↓ move · Tab/←→ switch · Space toggle · q exit\n' >&2
     printf '  Target must be equal or larger than source. The ENTIRE target is overwritten.\n' >&2
-    IFS= read -rsn1 key </dev/tty || { trap - INT TERM; tput cnorm 2>/dev/null >&2 || true; return 1; }
+    IFS= read -rsn1 key </dev/tty || { trap - INT TERM; tput cnorm 2>/dev/null >&2 || true; echo "Cancelled." >&2; return 1; }
     case "$key" in
       $'\x1b')
-        read -rsn2 -t 0.2 rest </dev/tty || { trap - INT TERM; tput cnorm 2>/dev/null >&2 || true; return 1; }
+        # lone ESC (no arrow bytes within 0.2s) = Cancel
+        read -rsn2 -t 0.2 rest </dev/tty || { trap - INT TERM; tput cnorm 2>/dev/null >&2 || true; echo "Cancelled." >&2; return 1; }
         case "$rest" in
           '[A'|'OA') if ((zone == 2)); then oi=$(((oi + 1) % 2)); else ti_step "$n" -1; fi ;;
           '[B'|'OB') if ((zone == 2)); then oi=$(((oi + 1) % 2)); else ti_step "$n" 1; fi ;;
@@ -254,7 +255,7 @@ pick_2col_tty_real() {
       $'l'|$'L') zone=2 ;;
       $'j'|$'J') if ((zone == 2)); then oi=$(((oi + 1) % 2)); else ti_step "$n" 1; fi ;;
       $'k'|$'K') if ((zone == 2)); then oi=$(((oi + 1) % 2)); else ti_step "$n" -1; fi ;;
-      $'q'|$'Q') trap - INT TERM; tput cnorm 2>/dev/null >&2 || true; return 1 ;;
+      $'q'|$'Q') trap - INT TERM; tput cnorm 2>/dev/null >&2 || true; echo "Cancelled." >&2; return 1 ;;
       '')
         tag="${rows[$ti]}"
         if [[ "/dev/$tag" == "$src" ]]; then err="that is the SOURCE — it is locked"; continue; fi
@@ -296,11 +297,19 @@ pick_2col_plain_real() { # numbered fallback; stdout: TAG|GROW|VERIFY
     printf '  %d) %s  %s\n' "${#tidx[@]}" "${rows[$i]}" "$(disk_line "/dev/${rows[$i]}" 2>/dev/null)" >&2
   done
   if (( ${#tidx[@]} == 0 )); then echo "No equal-or-larger target disk found." >&2; return 1; fi
-  read -rp "Pick TARGET [1-${#tidx[@]}]: " ans >&2 || return 1
+  printf '  0) Cancel — exit without cloning\n' >&2
+  read -rp "Pick TARGET [1-${#tidx[@]}, 0=Cancel]: " ans >&2 || { echo "Cancelled." >&2; return 1; }
+  case "$ans" in
+    0|"q"|"Q"|cancel|Cancel) echo "Cancelled." >&2; return 1 ;;
+    '') echo "Cancelled." >&2; return 1 ;;
+  esac
   if [[ "$ans" =~ ^[0-9]+$ ]] && ((ans >= 1 && ans <= ${#tidx[@]})); then i="${tidx[$((ans-1))]}"
-  else return 1; fi
-  read -rp "Resize cloned disk to fill target space? [y/N]: " rsz >&2 || return 1
-  read -rp "Verify after copy? [Y/n]: " vfy >&2 || return 1
+  else echo "Cancelled." >&2; return 1; fi
+  printf '  0) Cancel — exit without cloning\n' >&2
+  read -rp "Resize cloned disk to fill target space? [y/N, 0=Cancel]: " rsz >&2 || { echo "Cancelled." >&2; return 1; }
+  if [[ "$rsz" == "0" || "$rsz" =~ ^[Qq]$ || "$rsz" =~ ^[Cc]ancel$ ]]; then echo "Cancelled." >&2; return 1; fi
+  read -rp "Verify after copy? [Y/n, 0=Cancel]: " vfy >&2 || { echo "Cancelled." >&2; return 1; }
+  if [[ "$vfy" == "0" || "$vfy" =~ ^[Qq]$ || "$vfy" =~ ^[Cc]ancel$ ]]; then echo "Cancelled." >&2; return 1; fi
   if [[ "$rsz" =~ ^[Yy]$ ]]; then rsz=1; else rsz=0; fi
   if [[ "$vfy" =~ ^[Nn]$ ]]; then vfy=0; else vfy=1; fi
   printf '%s|%s|%s\n' "${rows[$i]}" "$rsz" "$vfy"
@@ -329,13 +338,15 @@ ui_main_menu() {
           else lbl="$(disk_line "/dev/$d")"; fi
           menu_args+=("$d" "$lbl")
         done < <(lsblk -dnro NAME -e7,254)
-        local t opts line verify=0 grow=0
+        menu_args+=("__exit" "— Exit without cloning —")
+        local t opts line verify=0 grow=0 pick_rc=0
         if _use_curses; then
-          t="$(ui_menu "Step 1/3 — pick TARGET (wiped)" "${menu_args[@]}")" || continue
-          [[ -z "$t" ]] && continue
+          t="$(ui_menu "Step 1/3 — pick TARGET (wiped) · Esc = back" "${menu_args[@]}")" || { pick_rc=$?; t=""; }
+          [[ "$t" == "__exit" ]] && { ui_msg "Exited without cloning."; break; }
+          ((pick_rc != 0 || -z "$t")) && continue
           [[ "/dev/$t" == "$src" ]] && { ui_msg "That is the SOURCE. It is locked."; continue; }
           tgt="/dev/$t"
-          opts="$(ui_checklist "Step 2/3 — options" verify "Re-verify after copy" on grow "Expand to fill bigger disk" off)" || continue
+          opts="$(ui_checklist "Step 2/3 — options · Esc = back" verify "Re-verify after copy" on grow "Expand to fill bigger disk" off)" || continue
           [[ "$opts" == *verify* ]] && verify=1
           [[ "$opts" == *grow* ]] && grow=1
         else
@@ -345,7 +356,11 @@ ui_main_menu() {
           [[ -n "$t" ]] || continue
           tgt="/dev/$t"
         fi
-        ui_yesno "Step 3/3 — clone?\n\n$src\n  → $tgt\n\nverify=$verify grow=$grow" || continue
+        # rc: 0=yes · 1=go back to menu · 255=Exit app
+        local confirm_rc=0
+        ui_yesno "Step 3/3 — clone?\n\n$src\n  → $tgt\n\nverify=$verify grow=$grow" || confirm_rc=$?
+        ((confirm_rc == 1)) && continue
+        ((confirm_rc == 255)) && break
         confirm_typing "$tgt" || continue
         _use_curses && clear 2>/dev/null || true
         printf '\n━━ cloning %s → %s ━━\n' "$src" "$tgt"

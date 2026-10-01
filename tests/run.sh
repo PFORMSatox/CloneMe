@@ -20,24 +20,53 @@ for f in clone-me.sh lib/common.sh lib/ui.sh tests/run.sh; do
   if bash -n "$f"; then ok "bash -n $f"; else bad "bash -n $f" "syntax error"; fi
 done
 
+# Dev-host expectations. Override to match your machine, or export
+# CLONE_TEST_NO_DISK=1 on CI/hosts without these disks: disk-specific
+# checks (T2–T5 real-pair parts) are then SKIPPED instead of failed.
+TEST_SRC="${CLONE_TEST_SRC:-/dev/nvme0n1}"
+TEST_TGT="${CLONE_TEST_TGT:-/dev/sdc}"
+TEST_SRC_BYTES="${CLONE_TEST_SRC_BYTES:-512110190592}"
+TEST_TGT_BYTES="${CLONE_TEST_TGT_BYTES:-2000398934016}"
+skip_disk_checks() {
+  [[ "${CLONE_TEST_NO_DISK:-0}" == "1" ]] && return 1
+  [[ -b "$TEST_SRC" && -b "$TEST_TGT" ]]
+}
+SKIP_DISKS=0
+skip_disk_checks || SKIP_DISKS=1
+skip() { echo "SKIP: $1 — ${2}"; }
+
 echo "== T2: source auto-detect =="
 src="$(detect_source_disk)"
-if [[ "$src" == "/dev/nvme0n1" ]]; then ok "detect_source_disk=$src"; else bad "detect_source_disk" "got $src, want /dev/nvme0n1"; fi
+if ((SKIP_DISKS)); then
+  skip "detect_source_disk" "expected $TEST_SRC not present"
+elif [[ "$src" == "$TEST_SRC" ]]; then ok "detect_source_disk=$src"; else bad "detect_source_disk" "got $src, want $TEST_SRC"; fi
 
 echo "== T3: sizes (read-only) =="
-sb="$(disk_bytes /dev/nvme0n1)"; tb="$(disk_bytes /dev/sdc)"
-[[ "$sb" == "512110190592" ]] && ok "source bytes=$sb" || bad "source bytes" "got $sb"
-[[ "$tb" == "2000398934016" ]] && ok "target bytes=$tb" || bad "target bytes" "got $tb"
+sb="$(disk_bytes "$TEST_SRC")"; tb="$(disk_bytes "$TEST_TGT")"
+if ((SKIP_DISKS)); then
+  skip "disk sizes" "expected pair not present"
+else
+  [[ "$sb" == "$TEST_SRC_BYTES" ]] && ok "source bytes=$sb" || bad "source bytes" "got $sb, want $TEST_SRC_BYTES"
+  [[ "$tb" == "$TEST_TGT_BYTES" ]] && ok "target bytes=$tb" || bad "target bytes" "got $tb, want $TEST_TGT_BYTES"
+fi
 
 echo "== T4: safety rejections (must fail, read-only) =="
-if safety_check /dev/nvme0n1 /dev/nvme0n1 2>/dev/null; then bad "same-disk" "accepted"; else ok "same-disk rejected"; fi
-if safety_check /dev/nvme0n1 /dev/nvme0n1p1 2>/dev/null; then bad "partition-of-source" "accepted"; else ok "partition-of-source rejected"; fi
-if safety_check /dev/nvme0n1 /dev/doesnotexist9 2>/dev/null; then bad "missing-target" "accepted"; else ok "missing-target rejected"; fi
-if safety_check /dev/nvme0n1 /dev/sdc 2>/dev/null | grep -q OK; then ok "real pair accepted (OK)"; else bad "real pair" "should print OK"; fi
+if ((SKIP_DISKS)); then
+  skip "safety rejections" "expected pair not present"
+else
+  if safety_check "$TEST_SRC" "$TEST_SRC" 2>/dev/null; then bad "same-disk" "accepted"; else ok "same-disk rejected"; fi
+  if safety_check "$TEST_SRC" "${TEST_SRC}1" 2>/dev/null; then bad "partition-of-source" "accepted"; else ok "partition-of-source rejected"; fi
+  if safety_check "$TEST_SRC" /dev/doesnotexist9 2>/dev/null; then bad "missing-target" "accepted"; else ok "missing-target rejected"; fi
+  if safety_check "$TEST_SRC" "$TEST_TGT" 2>/dev/null | grep -q OK; then ok "real pair accepted (OK)"; else bad "real pair" "should print OK"; fi
+fi
 
 echo "== T5: target must be unmounted + empty =="
-if target_mounted /dev/sdc; then bad "sdc-mounted" "has mounts"; else ok "sdc has no mounts"; fi
-[[ -z "$(lsblk -ndo PTTYPE /dev/sdc 2>/dev/null)" ]] && ok "sdc has no partition table (virgin)" || bad "sdc-pt" "unexpected table"
+if ((SKIP_DISKS)); then
+  skip "target state" "expected pair not present"
+else
+  if target_mounted "$TEST_TGT"; then bad "tgt-mounted" "has mounts"; else ok "target has no mounts"; fi
+  [[ -z "$(lsblk -ndo PTTYPE "$TEST_TGT" 2>/dev/null)" ]] && ok "target has no partition table (virgin)" || bad "target-pt" "unexpected table"
+fi
 
 echo "== T6: CLI arg errors (subshells, no root needed — fail before root check) =="
 if (cmd_clone 2>/dev/null); then bad "clone-no-target" "accepted"; else ok "clone-no-target rejected"; fi
@@ -54,12 +83,22 @@ got="$(printf 'sdc\n' | ui_input "Type" 2>/dev/null)"
 [[ "$got" == "sdc" ]] && ok "ui_input echo" || bad "ui_input" "got '$got'"
 if printf 'sdc\n' | confirm_typing /dev/sdc 2>/dev/null; then ok "confirm_typing match"; else bad "confirm_typing" "exact name should pass"; fi
 if printf 'sdd\n' | confirm_typing /dev/sdc 2>/dev/null; then bad "confirm_typing-wrong" "wrong name passed"; else ok "confirm_typing wrong-name rejected"; fi
-ov="$(overview_text /dev/nvme0n1 /dev/sdc)"
-grep -q "NEVER wiped" <<<"$ov" && grep -q "overwritten" <<<"$ov" || bad "overview_text" "missing sections"
-grep -q "nvme0n1p2" <<<"$ov" && ok "overview lists both partitions" || bad "overview_text" "missing p2 line"
-sg="$(suggest_target /dev/nvme0n1)"
-[[ "$sg" == "/dev/sdc" ]] && ok "suggest_target=$sg" || bad "suggest_target" "got '$sg'"
-[[ "$(pick_dd)" == "dd" ]] && ok "pick_dd=dd (ddrescue absent)" || bad "pick_dd" "unexpected"
+ov="$(overview_text "$TEST_SRC" "$TEST_TGT" 2>/dev/null || true)"
+grep -q "NEVER wiped" <<<"$ov" && grep -q "overwritten" <<<"$ov" && ok "overview_text sections" || bad "overview_text" "missing sections"
+# partition listing depends on the real layout of TEST_SRC
+if lsblk -nro NAME "$TEST_SRC" 2>/dev/null | grep -q p; then
+  grep -q "${TEST_SRC#/dev/}p" <<<"$ov" && ok "overview lists partitions" || bad "overview_text" "missing partition line"
+else
+  skip "overview partition line" "$TEST_SRC has no partitions here"
+fi
+if ((SKIP_DISKS)); then
+  skip "suggest_target" "expected pair not present"
+else
+  sg="$(suggest_target "$TEST_SRC")"
+  if [[ "$sg" == "$TEST_TGT" ]]; then ok "suggest_target=$sg"; else bad "suggest_target" "got '$sg', want largest non-source disk"; fi
+fi
+if command -v ddrescue >/dev/null 2>&1; then want_dd="ddrescue"; else want_dd="dd"; fi
+[[ "$(pick_dd)" == "$want_dd" ]] && ok "pick_dd=$want_dd" || bad "pick_dd" "unexpected"
 
 echo "== T8: progress + timer helpers =="
 [[ "$(fmt_duration 0 2>/dev/null)" == "00:00:00" ]] && ok "fmt_duration 0" || bad "fmt_duration 0" "missing or wrong"
@@ -75,6 +114,19 @@ line="$(printf '1\nn\ny\n' | pick_target_2col /dev/nvme1n1 2>/dev/null)" && rc=0
 if ((rc == 0)) && [[ "$line" =~ ^[A-Za-z0-9_.-]+\|[01]\|[01]$ ]]; then ok "picker line=$line"; else bad "picker" "rc=$rc line='$line'"; fi
 if printf '9\n' | pick_target_2col /dev/nvme1n1 2>/dev/null >/dev/null; then bad "picker-badchoice" "accepted"; else ok "picker bad choice rejected"; fi
 if tgt_eligible "" /dev/nvme1n1 /dev/nvme1n1 2>/dev/null; then bad "picker-samedisk" "accepted"; else ok "picker same-disk rejected"; fi
+
+echo "== T10: cancel / exit paths in the picker =="
+c_ok=0
+line="$(printf '1\nn\ny\n' | pick_2col_plain_real /dev/nvme1n1 2>/dev/null)" && c_ok=1
+if ((c_ok)) && [[ "$line" =~ ^[A-Za-z0-9_.-]+\|[01]\|[01]$ ]]; then ok "picker happy path=$line"; else bad "picker happy" "got '$line'"; fi
+if printf '0\n' | pick_2col_plain_real /dev/nvme1n1 2>/dev/null >/dev/null; then bad "cancel-0-target" "accepted"; else ok "cancel at target pick (0) rejected"; fi
+if printf 'q\n' | pick_2col_plain_real /dev/nvme1n1 2>/dev/null >/dev/null; then bad "cancel-q-target" "accepted"; else ok "cancel at target pick (q) rejected"; fi
+if printf '\n' | pick_2col_plain_real /dev/nvme1n1 2>/dev/null >/dev/null; then bad "cancel-enter-target" "accepted"; else ok "cancel at target pick (Enter) rejected"; fi
+if printf '1\n0\n' | pick_2col_plain_real /dev/nvme1n1 2>/dev/null >/dev/null; then bad "cancel-0-resize" "accepted"; else ok "cancel at resize (0) rejected"; fi
+if printf '1\nn\n0\n' | pick_2col_plain_real /dev/nvme1n1 2>/dev/null >/dev/null; then bad "cancel-0-verify" "accepted"; else ok "cancel at verify (0) rejected"; fi
+if printf '9\n' | pick_2col_plain_real /dev/nvme1n1 2>/dev/null >/dev/null; then bad "picker-out-of-range" "accepted"; else ok "out-of-range pick rejected"; fi
+# no eligible target (source is the largest disk) must refuse, not crash
+if printf '1\n' | pick_2col_plain_real /dev/nvme0n1 2>/dev/null >/dev/null; then bad "no-eligible-target" "accepted"; else ok "no eligible target rejected"; fi
 
 echo
 echo "RESULT: $PASS passed, $FAIL failed"
